@@ -1,9 +1,6 @@
-FROM nginx:alpine
-
-# Копируем наш статический файл в дефолтную директорию Nginx
-COPY index.html /usr/share/nginx/html/index.html
-
-# Nginx по умолчанию слушает порт 80
-EXPOSE 80
-
-CMD ["nginx", "-g", "daemon off;"]
+FROM python:3.12-slim
+WORKDIR /app
+COPY requirements.txt .
+RUN pip install --no-cache-dir -r requirements.txt
+COPY main.py .
+CMD ["uvicorn", "main:app", "--host", "0.0.0.0", "--port", "80"]
