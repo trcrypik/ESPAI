@@ -1,5 +1,5 @@
 from fastapi import FastAPI, Query
-from fastapi.responses import Response
+from fastapi.responses import Response, PlainTextResponse
 import edge_tts
 import logging
 
@@ -12,17 +12,27 @@ app = FastAPI()
 async def startup():
     log.info("TTS service started")
 
+@app.get("/")
+async def root():
+    # Чтобы в браузере по корню было что-то понятное
+    return PlainTextResponse(
+        "VoiceAssist TTS is running.\n"
+        "Try: /health\n"
+        "Try: /tts?text=Привет мир\n"
+    )
+
 @app.get("/health")
 async def health():
     return {"status": "ok"}
 
 @app.get("/tts")
 async def tts(text: str = Query("Привет. Тест связи.")):
-    log.info(f"TTS request: {text[:60]}...")
+    log.info(f"TTS request: {text[:60]}")
     comm = edge_tts.Communicate(text, voice="ru-RU-DmitryNeural")
     chunks = []
     async for chunk in comm.stream():
         if chunk["type"] == "audio":
             chunks.append(chunk["data"])
-    log.info(f"TTS done: {sum(len(c) for c in chunks)} bytes")
-    return Response(content=b"".join(chunks), media_type="audio/mpeg")
+    data = b"".join(chunks)
+    log.info(f"TTS done: {len(data)} bytes")
+    return Response(content=data, media_type="audio/mpeg")
