@@ -16,9 +16,9 @@ async def startup():
 async def root():
     # Чтобы в браузере по корню было что-то понятное
     return PlainTextResponse(
-        "VoiceAssist TTS is running.\n"
-        "Try: /health\n"
-        "Try: /tts?text=Привет мир\n"
+        "Start system...\n"
+        "Система запущена!\n"
+        "Тест: ок\n"
     )
 
 @app.get("/health")
