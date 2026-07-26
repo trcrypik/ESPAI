@@ -66,11 +66,17 @@ app.add_middleware(SlashNormalizer)
 def synthesize_piper(text: str) -> bytes:
     buf = io.BytesIO()
     with wave.open(buf, "wb") as wf:
-        wf.setnchannels(1)
-        wf.setsampwidth(2)
-        wf.setframerate(_voice.config.sample_rate)
-        _voice.synthesize(text, wf)
-    return buf.getvalue()
+        # let piper set wav params itself; also handle versions that RETURN audio
+        result = _voice.synthesize(text, wf)
+        if result is not None:
+            if isinstance(result, (bytes, bytearray)):
+                wf.writeframes(bytes(result))
+            else:
+                for chunk in result:
+                    wf.writeframes(chunk)
+    data = buf.getvalue()
+    log.info(f"Piper WAV: {len(data)} bytes for text len={len(text)}")
+    return data
 
 # ---- resample WAV -> raw PCM 24 kHz mono (for ESP32) ----
 def wav_to_pcm_24k(wav_bytes: bytes) -> bytes:
@@ -108,7 +114,7 @@ async def health():
             "voice_loaded": _voice is not None}
 
 @app.get("/tts")
-async def tts_mp3(text: str = Query("Привет. Тест связи.")):
+async def tts_test(text: str = Query("Привет. Тест связи.")):
     pcm = await tts(text)
     return Response(content=pcm, media_type="application/octet-stream")
 
