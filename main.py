@@ -51,22 +51,27 @@ class SlashNormalizer:
         await self.a(scope, receive, send)
 app.add_middleware(SlashNormalizer)
 
-# ---- TTS with retry (Edge TTS sometimes returns NoAudioReceived) ----
-async def synth_mp3(text: str, retries: int = 2) -> bytes:
+# ---- TTS: single attempt (no timeout here; callers wrap it) ----
+async def _synth_mp3_once(text: str) -> bytes:
+    comm = edge_tts.Communicate(text, voice=VOICE)
+    out = []
+    async for c in comm.stream():
+        if c["type"] == "audio":
+            out.append(c["data"])
+    data = b"".join(out)
+    if not data:
+        raise RuntimeError("empty audio")
+    return data
+
+# ---- TTS with retry + hard timeout (a hung Edge TTS no longer blocks the stream) ----
+async def synth_mp3(text: str, retries: int = 2, timeout: float = 15.0) -> bytes:
     last_err = None
     for attempt in range(retries + 1):
         try:
-            comm = edge_tts.Communicate(text, voice=VOICE)
-            out = []
-            async for c in comm.stream():
-                if c["type"] == "audio":
-                    out.append(c["data"])
-            data = b"".join(out)
-            if data:
-                return data
-            raise RuntimeError("empty audio")
+            return await asyncio.wait_for(_synth_mp3_once(text), timeout=timeout)
         except Exception as e:
             last_err = e
+            log.warning(f"synth_mp3 attempt {attempt} failed: {e}")
             if attempt < retries:
                 await asyncio.sleep(0.4 * (attempt + 1))
     raise last_err
@@ -81,7 +86,7 @@ def mp3_to_pcm(mp3: bytes, rate: int = PLAY_RATE) -> bytes:
         raise RuntimeError(p.stderr.decode("utf8", "ignore"))
     return p.stdout
 
-# ---- async ffmpeg (for /stream: does NOT block the event loop) ----
+# ---- async ffmpeg with timeout (for /stream: does NOT block the event loop) ----
 async def mp3_to_pcm_async(mp3: bytes, rate: int = PLAY_RATE) -> bytes:
     proc = await asyncio.create_subprocess_exec(
         "ffmpeg", "-nostdin", "-v", "error", "-i", "pipe:0",
@@ -89,7 +94,12 @@ async def mp3_to_pcm_async(mp3: bytes, rate: int = PLAY_RATE) -> bytes:
         stdin=asyncio.subprocess.PIPE,
         stdout=asyncio.subprocess.PIPE,
         stderr=asyncio.subprocess.PIPE)
-    stdout, stderr = await proc.communicate(input=mp3)
+    try:
+        stdout, stderr = await asyncio.wait_for(proc.communicate(input=mp3), timeout=10.0)
+    except asyncio.TimeoutError:
+        proc.kill()
+        await proc.wait()
+        raise RuntimeError("ffmpeg timeout")
     if proc.returncode != 0:
         raise RuntimeError(stderr.decode("utf8", "ignore"))
     return stdout
@@ -108,10 +118,10 @@ def split_sentences(text: str):
         p = p.strip()
         if not p:
             continue
-        if len(p) > 110:
+        if len(p) > 80:
             buf = ""
             for s in re.split(r'(?<=,)\s+', p):
-                if buf and len(buf) + len(s) + 1 <= 100:
+                if buf and len(buf) + len(s) + 1 <= 70:
                     buf += " " + s
                 else:
                     if buf: out.append(buf)
@@ -128,8 +138,8 @@ async def tts_stream(sentences):
         if not sent:
             continue
         try:
-            mp3 = await synth_mp3(sent)                 # retry inside
-            pcm = await mp3_to_pcm_async(mp3, PLAY_RATE)  # async ffmpeg
+            mp3 = await synth_mp3(sent)                    # retry + timeout inside
+            pcm = await mp3_to_pcm_async(mp3, PLAY_RATE)   # async ffmpeg + timeout
             log.info(f"TTS chunk {idx} ok: {len(pcm)} bytes | {sent[:50]}")
             yield pcm
         except Exception:
