@@ -1,8 +1,8 @@
-import os, re, io, wave, subprocess, logging, asyncio
+import os, re, io, wave, subprocess, logging, asyncio, time
 from urllib.parse import quote
 from fastapi import FastAPI, Query, Request
 from fastapi.responses import Response, PlainTextResponse
-import edge_tts
+from piper import PiperVoice
 from google import genai
 from google.genai import types
 
@@ -10,19 +10,31 @@ logging.basicConfig(level=logging.INFO)
 log = logging.getLogger("va")
 
 app = FastAPI()
-VOICE     = "ru-RU-DmitryNeural"
-PLAY_RATE = 24000
-MODEL     = os.getenv("GEMINI_MODEL", "gemini-3.5-flash-lite")
-API_KEY   = os.getenv("GEMINI_API_KEY", "")
-PROMPT    = ("Ты голосовой помощник на русском языке. Отвечай естественно и по делу, "
-             "без воды, обычно 2-4 предложения. Без списков, без скобок, без markdown, "
-             "чтобы ответ было удобно озвучить синтезатором речи.")
+PLAY_RATE   = 24000                                   # PCM rate sent to ESP32
+VOICE_ONNX  = os.getenv("PIPER_ONNX", "/app/models/ru_RU-ruslan-medium.onnx")
+VOICE_JSON  = os.getenv("PIPER_JSON", "/app/models/ru_RU-ruslan-medium.onnx.json")
+MODEL       = os.getenv("GEMINI_MODEL", "gemini-3.5-flash-lite")
+API_KEY     = os.getenv("GEMINI_API_KEY", "")
+PROMPT      = ("Ты голосовой помощник на русском языке. Отвечай естественно и по делу, "
+               "без воды, обычно 2-4 предложения. Без списков, без скобок, без markdown, "
+               "чтобы ответ было удобно озвучить синтезатором речи.")
 
 _gemini = genai.Client(api_key=API_KEY) if API_KEY else None
-if not API_KEY:
-    log.warning("GEMINI_API_KEY is not set!")
-else:
-    log.info(f"Gemini model = {MODEL}")
+_voice = None  # PiperVoice, loaded on startup
+
+def load_voice():
+    global _voice
+    t0 = time.time()
+    _voice = PiperVoice.load(VOICE_ONNX, config_path=VOICE_JSON)
+    log.info(f"Piper voice loaded in {time.time()-t0:.1f}s, sample_rate={_voice.config.sample_rate}")
+
+@app.on_event("startup")
+async def startup():
+    load_voice()
+    if not API_KEY:
+        log.warning("GEMINI_API_KEY is not set!")
+    else:
+        log.info(f"Gemini model = {MODEL}")
 
 # ---- translit ru -> lat (for OLED, ASCII only) ----
 _RU  = "абвгдеёжзийклмнопрстуфхцчшщъыьэюя"
@@ -50,36 +62,34 @@ class SlashNormalizer:
         await self.a(scope, receive, send)
 app.add_middleware(SlashNormalizer)
 
-# ---- TTS: ONE request for the whole reply, native receive_timeout (no asyncio.wait_for) ----
-async def synth_mp3(text: str, retries: int = 2, receive_timeout: float = 25) -> bytes:
-    last_err = None
-    for attempt in range(retries + 1):
-        try:
-            comm = edge_tts.Communicate(text, voice=VOICE, receive_timeout=receive_timeout)
-            out = []
-            async for c in comm.stream():
-                if c["type"] == "audio":
-                    out.append(c["data"])
-            data = b"".join(out)
-            if not data:
-                raise RuntimeError("empty audio")
-            return data
-        except Exception as e:
-            last_err = e
-            log.warning(f"synth_mp3 attempt {attempt} failed: {e}")
-            if attempt < retries:
-                await asyncio.sleep(0.5 * (attempt + 1))
-    raise last_err
+# ---- Piper: text -> WAV (model sample rate) ----
+def synthesize_piper(text: str) -> bytes:
+    buf = io.BytesIO()
+    with wave.open(buf, "wb") as wf:
+        wf.setnchannels(1)
+        wf.setsampwidth(2)
+        wf.setframerate(_voice.config.sample_rate)
+        _voice.synthesize(text, wf)
+    return buf.getvalue()
 
-def mp3_to_pcm(mp3: bytes, rate: int = PLAY_RATE) -> bytes:
+# ---- resample WAV -> raw PCM 24 kHz mono (for ESP32) ----
+def wav_to_pcm_24k(wav_bytes: bytes) -> bytes:
     p = subprocess.run(
         ["ffmpeg", "-nostdin", "-v", "error", "-i", "pipe:0",
-         "-f", "s16le", "-acodec", "pcm_s16le", "-ar", str(rate), "-ac", "1", "pipe:1"],
-        input=mp3, capture_output=True)
+         "-f", "s16le", "-acodec", "pcm_s16le", "-ar", str(PLAY_RATE), "-ac", "1", "pipe:1"],
+        input=wav_bytes, capture_output=True)
     if p.returncode != 0:
         raise RuntimeError(p.stderr.decode("utf8", "ignore"))
     return p.stdout
 
+# ---- TTS pipeline (runs in a thread so it doesn't block the event loop) ----
+def _tts_pipeline(text: str) -> bytes:
+    return wav_to_pcm_24k(synthesize_piper(text))
+
+async def tts(text: str) -> bytes:
+    return await asyncio.to_thread(_tts_pipeline, text)
+
+# ---- input audio -> WAV (for Gemini) ----
 def pcm_to_wav(pcm: bytes, rate: int, ch: int = 1, w: int = 2) -> bytes:
     buf = io.BytesIO()
     with wave.open(buf, "wb") as wf:
@@ -90,20 +100,23 @@ def pcm_to_wav(pcm: bytes, rate: int, ch: int = 1, w: int = 2) -> bytes:
 
 @app.get("/")
 async def root():
-    return PlainTextResponse("VoiceAssist ok. /health /tts /pcm /chat /stream\n")
+    return PlainTextResponse("VoiceAssist (Piper) ok. /health /tts /pcm /chat /stream\n")
 
 @app.get("/health")
 async def health():
-    return {"status": "ok", "model": MODEL, "key_set": bool(API_KEY)}
+    return {"status": "ok", "model": MODEL, "key_set": bool(API_KEY),
+            "voice_loaded": _voice is not None}
 
 @app.get("/tts")
-async def tts(text: str = Query("Привет. Тест связи.")):
-    return Response(content=await synth_mp3(text), media_type="audio/mpeg")
+async def tts_mp3(text: str = Query("Привет. Тест связи.")):
+    pcm = await tts(text)
+    return Response(content=pcm, media_type="application/octet-stream")
 
 @app.get("/pcm")
 async def pcm(text: str = Query("Привет. Тест связи.")):
     log.info(f"PCM(text): {text[:60]}")
-    return Response(content=mp3_to_pcm(await synth_mp3(text)), media_type="application/octet-stream")
+    out = await tts(text)
+    return Response(content=out, media_type="application/octet-stream")
 
 @app.post("/chat")
 async def chat(request: Request, rate: int = Query(16000)):
@@ -126,12 +139,11 @@ async def chat(request: Request, rate: int = Query(16000)):
     if not text:
         text = "Я не расслышал, повтори пожалуйста."
     log.info(f"REPLY: {text[:160]}")
-    out = mp3_to_pcm(await synth_mp3(text), PLAY_RATE)
+    out = await tts(text)
     headers = {"X-Reply-Text": quote(text, safe=""),
                "X-Reply-Oled": quote(translit(text), safe="")}
     return Response(content=out, media_type="application/octet-stream", headers=headers)
 
-# STREAM endpoint: now ONE Gemini call (audio->text) + ONE Edge TTS call (text->pcm)
 @app.post("/stream")
 async def stream(request: Request, rate: int = Query(16000)):
     body = await request.body()
@@ -156,15 +168,14 @@ async def stream(request: Request, rate: int = Query(16000)):
         text = "Я не расслышал, повтори пожалуйста."
     log.info(f"REPLY: {text[:160]}")
 
-    # 2) Edge TTS: whole answer in ONE request (with retry + native timeout)
+    # 2) Piper: text -> PCM 24k (local, stable)
     try:
-        mp3 = await synth_mp3(text)
+        t0 = time.time()
+        pcm = await tts(text)
+        log.info(f"Piper TTS ok: {len(pcm)} bytes (~{len(pcm)/2/PLAY_RATE:.1f}s) in {time.time()-t0:.1f}s")
     except Exception as e:
-        log.exception("tts error")
-        return Response(status_code=502, content=f"tts error: {e}")
-
-    pcm = mp3_to_pcm(mp3, PLAY_RATE)
-    log.info(f"TTS ok: {len(pcm)} bytes (~{len(pcm)/2/PLAY_RATE:.1f}s)")
+        log.exception("piper error")
+        return Response(status_code=502, content=f"piper error: {e}")
 
     headers = {"X-Reply-Text": quote(text, safe=""),
                "X-Reply-Oled": quote(translit(text), safe="")}
