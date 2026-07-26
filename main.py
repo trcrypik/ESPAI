@@ -11,7 +11,7 @@ log = logging.getLogger("va")
 app = FastAPI()
 VOICE     = "ru-RU-DmitryNeural"
 PLAY_RATE = 24000
-MODEL     = os.getenv("GEMINI_MODEL", "gemini-3.5-flash-lite")   # one-line change if id differs
+MODEL     = os.getenv("GEMINI_MODEL", "gemini-3.5-flash-lite")   # one-line change if id differs *
 API_KEY   = os.getenv("GEMINI_API_KEY", "")
 PROMPT    = ("Ты голосовой помощник на русском языке. Отвечай кратко и естественно: "
              "1-3 предложения, без списков, без markdown и без скобок, "
