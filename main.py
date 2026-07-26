@@ -64,7 +64,7 @@ async def _synth_mp3_once(text: str) -> bytes:
     return data
 
 # ---- TTS with retry + hard timeout (a hung Edge TTS no longer blocks the stream) ----
-async def synth_mp3(text: str, retries: int = 2, timeout: float = 15.0) -> bytes:
+async def synth_mp3(text: str, retries: int = 2, timeout: float = 30.0) -> bytes:
     last_err = None
     for attempt in range(retries + 1):
         try:
