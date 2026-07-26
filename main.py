@@ -14,9 +14,9 @@ VOICE     = "ru-RU-DmitryNeural"
 PLAY_RATE = 24000
 MODEL     = os.getenv("GEMINI_MODEL", "gemini-3.5-flash-lite")
 API_KEY   = os.getenv("GEMINI_API_KEY", "")
-PROMPT    = ("Ты голосовой помощник на русском языке. Отвечай кратко и естественно, "
-             "обычно 1-3 предложения. Без списков, без скобок, без markdown, "
-             "чтобы ответ было удобно озвучить.")
+PROMPT    = ("Ты голосовой помощник на русском языке. Отвечай естественно и по делу, "
+             "без воды, обычно 2-4 предложения. Без списков, без скобок, без markdown, "
+             "чтобы ответ было удобно озвучить синтезатором речи.")
 
 _gemini = genai.Client(api_key=API_KEY) if API_KEY else None
 if not API_KEY:
@@ -24,6 +24,7 @@ if not API_KEY:
 else:
     log.info(f"Gemini model = {MODEL}")
 
+# ---- translit ru -> lat (for OLED, ASCII only) ----
 _RU  = "абвгдеёжзийклмнопрстуфхцчшщъыьэюя"
 _LAT = ["a","b","v","g","d","e","e","zh","z","i","y","k","l","m","n","o",
         "p","r","s","t","u","f","h","ts","ch","sh","sch","","y","","e","yu","ya"]
@@ -38,6 +39,7 @@ def translit(text: str) -> str:
             out.append(ch)
     return "".join(out)
 
+# collapse multiple slashes (//chat -> /chat)
 class SlashNormalizer:
     def __init__(self, a): self.a = a
     async def __call__(self, scope, receive, send):
@@ -49,7 +51,7 @@ class SlashNormalizer:
         await self.a(scope, receive, send)
 app.add_middleware(SlashNormalizer)
 
-# TTS with retry (Edge TTS sometimes returns NoAudioReceived)
+# ---- TTS with retry (Edge TTS sometimes returns NoAudioReceived) ----
 async def synth_mp3(text: str, retries: int = 2) -> bytes:
     last_err = None
     for attempt in range(retries + 1):
@@ -69,6 +71,7 @@ async def synth_mp3(text: str, retries: int = 2) -> bytes:
                 await asyncio.sleep(0.4 * (attempt + 1))
     raise last_err
 
+# ---- sync ffmpeg (for non-streaming endpoints) ----
 def mp3_to_pcm(mp3: bytes, rate: int = PLAY_RATE) -> bytes:
     p = subprocess.run(
         ["ffmpeg", "-nostdin", "-v", "error", "-i", "pipe:0",
@@ -78,12 +81,26 @@ def mp3_to_pcm(mp3: bytes, rate: int = PLAY_RATE) -> bytes:
         raise RuntimeError(p.stderr.decode("utf8", "ignore"))
     return p.stdout
 
+# ---- async ffmpeg (for /stream: does NOT block the event loop) ----
+async def mp3_to_pcm_async(mp3: bytes, rate: int = PLAY_RATE) -> bytes:
+    proc = await asyncio.create_subprocess_exec(
+        "ffmpeg", "-nostdin", "-v", "error", "-i", "pipe:0",
+        "-f", "s16le", "-acodec", "pcm_s16le", "-ar", str(rate), "-ac", "1", "pipe:1",
+        stdin=asyncio.subprocess.PIPE,
+        stdout=asyncio.subprocess.PIPE,
+        stderr=asyncio.subprocess.PIPE)
+    stdout, stderr = await proc.communicate(input=mp3)
+    if proc.returncode != 0:
+        raise RuntimeError(stderr.decode("utf8", "ignore"))
+    return stdout
+
 def pcm_to_wav(pcm: bytes, rate: int, ch: int = 1, w: int = 2) -> bytes:
     buf = io.BytesIO()
     with wave.open(buf, "wb") as wf:
         wf.setnchannels(ch); wf.setsampwidth(w); wf.setframerate(rate); wf.writeframes(pcm)
     return buf.getvalue()
 
+# ---- split reply into speakable chunks (sentences; long ones by commas) ----
 def split_sentences(text: str):
     parts = re.split(r'(?<=[.!?…])\s+', text.strip())
     out = []
@@ -104,16 +121,21 @@ def split_sentences(text: str):
             out.append(p)
     return out or [text]
 
+# ---- async generator: TTS per sentence -> PCM chunk (with per-chunk log) ----
 async def tts_stream(sentences):
-    for sent in sentences:
+    for idx, sent in enumerate(sentences):
         sent = sent.strip()
         if not sent:
             continue
         try:
-            mp3 = await synth_mp3(sent)          # has retry inside
-            yield mp3_to_pcm(mp3, PLAY_RATE)
+            mp3 = await synth_mp3(sent)                 # retry inside
+            pcm = await mp3_to_pcm_async(mp3, PLAY_RATE)  # async ffmpeg
+            log.info(f"TTS chunk {idx} ok: {len(pcm)} bytes | {sent[:50]}")
+            yield pcm
         except Exception:
-            log.exception("tts chunk error")     # skip sentence, keep going
+            log.exception(f"TTS chunk {idx} FAILED, skipped | {sent[:50]}")
+
+# ===================== endpoints =====================
 
 @app.get("/")
 async def root():
@@ -132,6 +154,7 @@ async def pcm(text: str = Query("Привет. Тест связи.")):
     log.info(f"PCM(text): {text[:60]}")
     return Response(content=mp3_to_pcm(await synth_mp3(text)), media_type="application/octet-stream")
 
+# non-streaming (kept for compatibility / SET test)
 @app.post("/chat")
 async def chat(request: Request, rate: int = Query(16000)):
     body = await request.body()
@@ -158,6 +181,7 @@ async def chat(request: Request, rate: int = Query(16000)):
                "X-Reply-Oled": quote(translit(text), safe="")}
     return Response(content=out, media_type="application/octet-stream", headers=headers)
 
+# STREAMING: Gemini text -> TTS per sentence -> PCM chunks (chunked transfer)
 @app.post("/stream")
 async def stream(request: Request, rate: int = Query(16000)):
     body = await request.body()
@@ -181,6 +205,7 @@ async def stream(request: Request, rate: int = Query(16000)):
     log.info(f"REPLY: {text[:160]}")
     sentences = split_sentences(text)
     headers = {"X-Reply-Text": quote(text, safe=""),
-               "X-Reply-Oled": quote(translit(text), safe="")}
+               "X-Reply-Oled": quote(translit(text), safe=""),
+               "X-Accel-Buffering": "no"}          # disable ingress buffering of the stream
     return StreamingResponse(tts_stream(sentences),
                              media_type="application/octet-stream", headers=headers)
