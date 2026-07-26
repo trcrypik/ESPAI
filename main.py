@@ -1,4 +1,4 @@
-import os, re, io, wave, subprocess, logging
+import os, re, io, wave, subprocess, logging, asyncio
 from urllib.parse import quote
 from fastapi import FastAPI, Query, Request
 from fastapi.responses import Response, PlainTextResponse, StreamingResponse
@@ -24,7 +24,6 @@ if not API_KEY:
 else:
     log.info(f"Gemini model = {MODEL}")
 
-# ---- translit ru -> lat (for OLED, ASCII only) ----
 _RU  = "абвгдеёжзийклмнопрстуфхцчшщъыьэюя"
 _LAT = ["a","b","v","g","d","e","e","zh","z","i","y","k","l","m","n","o",
         "p","r","s","t","u","f","h","ts","ch","sh","sch","","y","","e","yu","ya"]
@@ -39,7 +38,6 @@ def translit(text: str) -> str:
             out.append(ch)
     return "".join(out)
 
-# collapse multiple slashes (//chat -> /chat)
 class SlashNormalizer:
     def __init__(self, a): self.a = a
     async def __call__(self, scope, receive, send):
@@ -51,13 +49,25 @@ class SlashNormalizer:
         await self.a(scope, receive, send)
 app.add_middleware(SlashNormalizer)
 
-async def synth_mp3(text: str) -> bytes:
-    comm = edge_tts.Communicate(text, voice=VOICE)
-    out = []
-    async for c in comm.stream():
-        if c["type"] == "audio":
-            out.append(c["data"])
-    return b"".join(out)
+# TTS with retry (Edge TTS sometimes returns NoAudioReceived)
+async def synth_mp3(text: str, retries: int = 2) -> bytes:
+    last_err = None
+    for attempt in range(retries + 1):
+        try:
+            comm = edge_tts.Communicate(text, voice=VOICE)
+            out = []
+            async for c in comm.stream():
+                if c["type"] == "audio":
+                    out.append(c["data"])
+            data = b"".join(out)
+            if data:
+                return data
+            raise RuntimeError("empty audio")
+        except Exception as e:
+            last_err = e
+            if attempt < retries:
+                await asyncio.sleep(0.4 * (attempt + 1))
+    raise last_err
 
 def mp3_to_pcm(mp3: bytes, rate: int = PLAY_RATE) -> bytes:
     p = subprocess.run(
@@ -74,7 +84,6 @@ def pcm_to_wav(pcm: bytes, rate: int, ch: int = 1, w: int = 2) -> bytes:
         wf.setnchannels(ch); wf.setsampwidth(w); wf.setframerate(rate); wf.writeframes(pcm)
     return buf.getvalue()
 
-# split reply into speakable chunks (sentences; long ones by commas)
 def split_sentences(text: str):
     parts = re.split(r'(?<=[.!?…])\s+', text.strip())
     out = []
@@ -95,17 +104,16 @@ def split_sentences(text: str):
             out.append(p)
     return out or [text]
 
-# async generator: TTS per sentence -> PCM chunk
 async def tts_stream(sentences):
     for sent in sentences:
         sent = sent.strip()
         if not sent:
             continue
         try:
-            mp3 = await synth_mp3(sent)
+            mp3 = await synth_mp3(sent)          # has retry inside
             yield mp3_to_pcm(mp3, PLAY_RATE)
         except Exception:
-            log.exception("tts chunk error")  # skip this sentence, keep going
+            log.exception("tts chunk error")     # skip sentence, keep going
 
 @app.get("/")
 async def root():
@@ -124,7 +132,6 @@ async def pcm(text: str = Query("Привет. Тест связи.")):
     log.info(f"PCM(text): {text[:60]}")
     return Response(content=mp3_to_pcm(await synth_mp3(text)), media_type="application/octet-stream")
 
-# non-streaming (kept for compatibility / tests)
 @app.post("/chat")
 async def chat(request: Request, rate: int = Query(16000)):
     body = await request.body()
@@ -151,7 +158,6 @@ async def chat(request: Request, rate: int = Query(16000)):
                "X-Reply-Oled": quote(translit(text), safe="")}
     return Response(content=out, media_type="application/octet-stream", headers=headers)
 
-# STREAMING: Gemini text -> TTS per sentence -> PCM chunks (chunked transfer)
 @app.post("/stream")
 async def stream(request: Request, rate: int = Query(16000)):
     body = await request.body()
