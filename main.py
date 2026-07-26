@@ -42,8 +42,8 @@ def translit(text: str) -> str:
 
 # collapse multiple slashes (//chat -> /chat)
 class SlashNormalizer:
-    def init(self, a): self.a = a
-    async def call(self, scope, receive, send):
+    def __init__(self, a): self.a = a
+    async def __call__(self, scope, receive, send):
         if scope["type"] == "http":
             p = scope.get("path", "")
             if "//" in p:
@@ -105,3 +105,30 @@ async def chat(request: Request, rate: int = Query(16000)):
 
     wav = pcm_to_wav(body, rate)
     log.info(f"CHAT in: {len(body)} bytes @{rate}Hz -> wav {len(wav)}B")
+
+    try:
+        resp = _gemini.models.generate_content(
+            model=MODEL,
+            contents=[
+                types.Part.from_bytes(data=wav, mime_type="audio/wav"),
+                types.Part.from_text(text=PROMPT),
+            ],
+        )
+        text = (getattr(resp, "text", None) or "").strip()
+    except Exception as e:
+        log.exception("gemini error")
+        return Response(status_code=502, content=f"gemini error: {e}")
+
+    if not text:
+        text = "Я не расслышал, повтори пожалуйста."
+    log.info(f"REPLY: {text[:160]}")
+
+    mp3 = await synth_mp3(text)
+    out = mp3_to_pcm(mp3, PLAY_RATE)
+    log.info(f"CHAT out pcm: {len(out)} bytes")
+
+    headers = {
+        "X-Reply-Text": quote(text, safe=""),          # UTF-8 original -> Serial
+        "X-Reply-Oled": quote(translit(text), safe=""),# translit ASCII -> OLED
+    }
+    return Response(content=out, media_type="application/octet-stream", headers=headers)
