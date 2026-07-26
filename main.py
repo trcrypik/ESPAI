@@ -1,4 +1,5 @@
 import os, re, io, wave, subprocess, logging
+from urllib.parse import quote
 from fastapi import FastAPI, Query, Request
 from fastapi.responses import Response, PlainTextResponse
 import edge_tts
@@ -11,11 +12,12 @@ log = logging.getLogger("va")
 app = FastAPI()
 VOICE     = "ru-RU-DmitryNeural"
 PLAY_RATE = 24000
-MODEL     = os.getenv("GEMINI_MODEL", "gemini-3.5-flash-lite")   # one-line change if id differs *
+MODEL     = os.getenv("GEMINI_MODEL", "gemini-3.5-flash-lite")
 API_KEY   = os.getenv("GEMINI_API_KEY", "")
-PROMPT    = ("Ты голосовой помощник на русском языке. Отвечай кратко и естественно: "
-             "1-3 предложения, без списков, без markdown и без скобок, "
-             "чтобы ответ удобно было озвучить синтезатором речи.")
+# shorter answers -> faster TTS -> fewer ingress TTFB timeouts
+PROMPT    = ("Ты голосовой помощник на русском языке. Отвечай ОЧЕНЬ кратко: "
+             "максимум 1-2 предложения, до 20 слов. Без списков, без скобок, "
+             "без markdown, чтобы ответ было удобно озвучить.")
 
 _gemini = genai.Client(api_key=API_KEY) if API_KEY else None
 if not API_KEY:
@@ -23,10 +25,25 @@ if not API_KEY:
 else:
     log.info(f"Gemini model = {MODEL}")
 
+# ---- translit ru -> lat (for OLED, ASCII only) ----
+_RU  = "абвгдеёжзийклмнопрстуфхцчшщъыьэюя"
+_LAT = ["a","b","v","g","d","e","e","zh","z","i","y","k","l","m","n","o",
+        "p","r","s","t","u","f","h","ts","ch","sh","sch","","y","","e","yu","ya"]
+def translit(text: str) -> str:
+    out = []
+    for ch in text:
+        idx = _RU.find(ch.lower())
+        if idx >= 0:
+            t = _LAT[idx]
+            out.append(t.capitalize() if (ch.isupper() and t) else t)
+        else:
+            out.append(ch)
+    return "".join(out)
+
 # collapse multiple slashes (//chat -> /chat)
 class SlashNormalizer:
-    def __init__(self, a): self.a = a
-    async def __call__(self, scope, receive, send):
+    def init(self, a): self.a = a
+    async def call(self, scope, receive, send):
         if scope["type"] == "http":
             p = scope.get("path", "")
             if "//" in p:
@@ -80,32 +97,11 @@ async def pcm(text: str = Query("Привет. Тест связи.")):
 @app.post("/chat")
 async def chat(request: Request, rate: int = Query(16000)):
     body = await request.body()
-    if not body:
-        return Response(status_code=400, content="empty audio")
+    min_bytes = int(rate * 2 * 0.3)
+    if len(body) < min_bytes:
+        return Response(status_code=400, content=f"audio too short ({len(body)} bytes)")
     if _gemini is None:
         return Response(status_code=500, content="GEMINI_API_KEY not configured")
 
     wav = pcm_to_wav(body, rate)
     log.info(f"CHAT in: {len(body)} bytes @{rate}Hz -> wav {len(wav)}B")
-
-    try:
-        resp = _gemini.models.generate_content(
-            model=MODEL,
-            contents=[
-                types.Part.from_bytes(data=wav, mime_type="audio/wav"),
-                types.Part.from_text(text=PROMPT),
-            ],
-        )
-        text = (getattr(resp, "text", None) or "").strip()
-    except Exception as e:
-        log.exception("gemini error")
-        return Response(status_code=502, content=f"gemini error: {e}")
-
-    if not text:
-        text = "Я не расслышал, повтори пожалуйста."
-    log.info(f"REPLY: {text[:120]}")
-
-    mp3 = await synth_mp3(text)
-    out = mp3_to_pcm(mp3, PLAY_RATE)
-    log.info(f"CHAT out pcm: {len(out)} bytes")
-    return Response(content=out, media_type="application/octet-stream")
