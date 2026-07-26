@@ -51,7 +51,7 @@ class SlashNormalizer:
 app.add_middleware(SlashNormalizer)
 
 # ---- TTS: ONE request for the whole reply, native receive_timeout (no asyncio.wait_for) ----
-async def synth_mp3(text: str, retries: int = 2, receive_timeout: float = 25.0) -> bytes:
+async def synth_mp3(text: str, retries: int = 2, receive_timeout: float = 25) -> bytes:
     last_err = None
     for attempt in range(retries + 1):
         try:
