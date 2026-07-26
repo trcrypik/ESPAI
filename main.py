@@ -1,7 +1,7 @@
 import os, re, io, wave, subprocess, logging
 from urllib.parse import quote
 from fastapi import FastAPI, Query, Request
-from fastapi.responses import Response, PlainTextResponse
+from fastapi.responses import Response, PlainTextResponse, StreamingResponse
 import edge_tts
 from google import genai
 from google.genai import types
@@ -14,10 +14,9 @@ VOICE     = "ru-RU-DmitryNeural"
 PLAY_RATE = 24000
 MODEL     = os.getenv("GEMINI_MODEL", "gemini-3.5-flash-lite")
 API_KEY   = os.getenv("GEMINI_API_KEY", "")
-# shorter answers -> faster TTS -> fewer ingress TTFB timeouts
-PROMPT    = ("Ты голосовой помощник на русском языке. Отвечай ОЧЕНЬ кратко: "
-             "максимум 1-2 предложения, до 20 слов. Без списков, без скобок, "
-             "без markdown, чтобы ответ было удобно озвучить.")
+PROMPT    = ("Ты голосовой помощник на русском языке. Отвечай кратко и естественно, "
+             "обычно 1-3 предложения. Без списков, без скобок, без markdown, "
+             "чтобы ответ было удобно озвучить.")
 
 _gemini = genai.Client(api_key=API_KEY) if API_KEY else None
 if not API_KEY:
@@ -75,9 +74,42 @@ def pcm_to_wav(pcm: bytes, rate: int, ch: int = 1, w: int = 2) -> bytes:
         wf.setnchannels(ch); wf.setsampwidth(w); wf.setframerate(rate); wf.writeframes(pcm)
     return buf.getvalue()
 
+# split reply into speakable chunks (sentences; long ones by commas)
+def split_sentences(text: str):
+    parts = re.split(r'(?<=[.!?…])\s+', text.strip())
+    out = []
+    for p in parts:
+        p = p.strip()
+        if not p:
+            continue
+        if len(p) > 110:
+            buf = ""
+            for s in re.split(r'(?<=,)\s+', p):
+                if buf and len(buf) + len(s) + 1 <= 100:
+                    buf += " " + s
+                else:
+                    if buf: out.append(buf)
+                    buf = s
+            if buf: out.append(buf)
+        else:
+            out.append(p)
+    return out or [text]
+
+# async generator: TTS per sentence -> PCM chunk
+async def tts_stream(sentences):
+    for sent in sentences:
+        sent = sent.strip()
+        if not sent:
+            continue
+        try:
+            mp3 = await synth_mp3(sent)
+            yield mp3_to_pcm(mp3, PLAY_RATE)
+        except Exception:
+            log.exception("tts chunk error")  # skip this sentence, keep going
+
 @app.get("/")
 async def root():
-    return PlainTextResponse("VoiceAssist ok. /health /tts /pcm /chat\n")
+    return PlainTextResponse("VoiceAssist ok. /health /tts /pcm /chat /stream\n")
 
 @app.get("/health")
 async def health():
@@ -90,45 +122,59 @@ async def tts(text: str = Query("Привет. Тест связи.")):
 @app.get("/pcm")
 async def pcm(text: str = Query("Привет. Тест связи.")):
     log.info(f"PCM(text): {text[:60]}")
-    mp3 = await synth_mp3(text)
-    data = mp3_to_pcm(mp3)
-    return Response(content=data, media_type="application/octet-stream")
+    return Response(content=mp3_to_pcm(await synth_mp3(text)), media_type="application/octet-stream")
 
+# non-streaming (kept for compatibility / tests)
 @app.post("/chat")
 async def chat(request: Request, rate: int = Query(16000)):
     body = await request.body()
-    min_bytes = int(rate * 2 * 0.3)
-    if len(body) < min_bytes:
+    if len(body) < int(rate * 2 * 0.3):
         return Response(status_code=400, content=f"audio too short ({len(body)} bytes)")
     if _gemini is None:
         return Response(status_code=500, content="GEMINI_API_KEY not configured")
-
     wav = pcm_to_wav(body, rate)
-    log.info(f"CHAT in: {len(body)} bytes @{rate}Hz -> wav {len(wav)}B")
-
+    log.info(f"CHAT in: {len(body)} bytes @{rate}Hz")
     try:
         resp = _gemini.models.generate_content(
             model=MODEL,
-            contents=[
-                types.Part.from_bytes(data=wav, mime_type="audio/wav"),
-                types.Part.from_text(text=PROMPT),
-            ],
-        )
+            contents=[types.Part.from_bytes(data=wav, mime_type="audio/wav"),
+                      types.Part.from_text(text=PROMPT)])
         text = (getattr(resp, "text", None) or "").strip()
     except Exception as e:
         log.exception("gemini error")
         return Response(status_code=502, content=f"gemini error: {e}")
-
     if not text:
         text = "Я не расслышал, повтори пожалуйста."
     log.info(f"REPLY: {text[:160]}")
-
-    mp3 = await synth_mp3(text)
-    out = mp3_to_pcm(mp3, PLAY_RATE)
-    log.info(f"CHAT out pcm: {len(out)} bytes")
-
-    headers = {
-        "X-Reply-Text": quote(text, safe=""),          # UTF-8 original -> Serial
-        "X-Reply-Oled": quote(translit(text), safe=""),# translit ASCII -> OLED
-    }
+    out = mp3_to_pcm(await synth_mp3(text), PLAY_RATE)
+    headers = {"X-Reply-Text": quote(text, safe=""),
+               "X-Reply-Oled": quote(translit(text), safe="")}
     return Response(content=out, media_type="application/octet-stream", headers=headers)
+
+# STREAMING: Gemini text -> TTS per sentence -> PCM chunks (chunked transfer)
+@app.post("/stream")
+async def stream(request: Request, rate: int = Query(16000)):
+    body = await request.body()
+    if len(body) < int(rate * 2 * 0.3):
+        return Response(status_code=400, content=f"audio too short ({len(body)} bytes)")
+    if _gemini is None:
+        return Response(status_code=500, content="GEMINI_API_KEY not configured")
+    wav = pcm_to_wav(body, rate)
+    log.info(f"STREAM in: {len(body)} bytes @{rate}Hz")
+    try:
+        resp = _gemini.models.generate_content(
+            model=MODEL,
+            contents=[types.Part.from_bytes(data=wav, mime_type="audio/wav"),
+                      types.Part.from_text(text=PROMPT)])
+        text = (getattr(resp, "text", None) or "").strip()
+    except Exception as e:
+        log.exception("gemini error")
+        return Response(status_code=502, content=f"gemini error: {e}")
+    if not text:
+        text = "Я не расслышал, повтори пожалуйста."
+    log.info(f"REPLY: {text[:160]}")
+    sentences = split_sentences(text)
+    headers = {"X-Reply-Text": quote(text, safe=""),
+               "X-Reply-Oled": quote(translit(text), safe="")}
+    return StreamingResponse(tts_stream(sentences),
+                             media_type="application/octet-stream", headers=headers)
