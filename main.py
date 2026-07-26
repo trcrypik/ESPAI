@@ -66,14 +66,16 @@ app.add_middleware(SlashNormalizer)
 def synthesize_piper(text: str) -> bytes:
     buf = io.BytesIO()
     with wave.open(buf, "wb") as wf:
-        # let piper set wav params itself; also handle versions that RETURN audio
-        result = _voice.synthesize(text, wf)
-        if result is not None:
-            if isinstance(result, (bytes, bytearray)):
-                wf.writeframes(bytes(result))
-            else:
-                for chunk in result:
-                    wf.writeframes(chunk)
+        if hasattr(_voice, "synthesize_wav"):
+            # current piper-tts API: writes WAV and sets params itself
+            _voice.synthesize_wav(text, wf)
+        else:
+            # fallback: raw PCM stream, set WAV params manually
+            wf.setnchannels(1)
+            wf.setsampwidth(2)
+            wf.setframerate(_voice.config.sample_rate)
+            for chunk in _voice.synthesize_stream_raw(text):
+                wf.writeframes(chunk)
     data = buf.getvalue()
     log.info(f"Piper WAV: {len(data)} bytes for text len={len(text)}")
     return data
