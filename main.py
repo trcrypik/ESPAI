@@ -85,7 +85,7 @@ def pcm_to_wav(pcm: bytes, rate: int, ch: int = 1, w: int = 2) -> bytes:
 
 @app.get("/")
 async def root():
-    return PlainTextResponse("VoiceAssist (Piper stream) ok. /health /pcm /chat /stream\n")
+    return PlainTextResponse("Error: 404\n")
 
 @app.get("/speedtest")
 async def speedtest(size: int = Query(1000000)):
