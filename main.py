@@ -87,6 +87,18 @@ def pcm_to_wav(pcm: bytes, rate: int, ch: int = 1, w: int = 2) -> bytes:
 async def root():
     return PlainTextResponse("VoiceAssist (Piper stream) ok. /health /pcm /chat /stream\n")
 
+@app.get("/speedtest")
+async def speedtest(size: int = Query(1000000)):
+    async def gen():
+        chunk = b"\0" * 65536
+        remaining = size
+        while remaining > 0:
+            n = 65536 if remaining > 65536 else remaining
+            yield chunk[:n]
+            remaining -= n
+    return StreamingResponse(gen(), media_type="application/octet-stream",
+                             headers={"Content-Length": str(size)})
+
 @app.get("/health")
 async def health():
     return {"status": "ok", "model": MODEL, "key_set": bool(API_KEY),
