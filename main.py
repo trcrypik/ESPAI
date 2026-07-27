@@ -92,13 +92,16 @@ async def speedtest(size: int = Query(1000000)):
     async def gen():
         chunk = b"\0" * 65536
         remaining = size
+        sent = 0
         while remaining > 0:
             n = 65536 if remaining > 65536 else remaining
             yield chunk[:n]
+            sent += n
             remaining -= n
+        log.info(f"speedtest: SERVER sent all {sent} bytes")
     return StreamingResponse(gen(), media_type="application/octet-stream",
-                             headers={"Content-Length": str(size)})
-
+                             headers={"X-Accel-Buffering": "no", "Cache-Control": "no-store"})
+  
 @app.get("/health")
 async def health():
     return {"status": "ok", "model": MODEL, "key_set": bool(API_KEY),
