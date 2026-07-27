@@ -66,7 +66,6 @@ app.add_middleware(SlashNormalizer)
 def synth_pcm(text: str) -> bytes:
     if hasattr(_voice, "synthesize_stream_raw"):
         return b"".join(_voice.synthesize_stream_raw(text))
-    # fallback via WAV
     buf = io.BytesIO()
     with wave.open(buf, "wb") as wf:
         _voice.synthesize_wav(text, wf)
@@ -85,29 +84,18 @@ def pcm_to_wav(pcm: bytes, rate: int, ch: int = 1, w: int = 2) -> bytes:
 
 @app.get("/")
 async def root():
-    return PlainTextResponse("Error: 404\n")
+    return PlainTextResponse("VoiceAssist (Piper) ok. /health /tts /pcm /chat /stream /speedtest\n")
 
-@app.get("/speedtest")
-async def speedtest(size: int = Query(1000000)):
-    async def gen():
-        chunk = b"\0" * 65536
-        remaining = size
-        sent = 0
-        while remaining > 0:
-            n = 65536 if remaining > 65536 else remaining
-            yield chunk[:n]
-            sent += n
-            remaining -= n
-        log.info(f"speedtest: SERVER sent all {sent} bytes")
-    return StreamingResponse(gen(), media_type="application/octet-stream",
-                             headers={"X-Accel-Buffering": "no", "Cache-Control": "no-store"})
-  
 @app.get("/health")
 async def health():
     return {"status": "ok", "model": MODEL, "key_set": bool(API_KEY),
             "voice_loaded": _voice is not None, "play_rate": PLAY_RATE}
 
-# non-streaming PCM (for SET test on device) — full buffer, Content-Length
+@app.get("/tts")
+async def tts_test(text: str = Query("Привет. Тест связи.")):
+    pcm = await asyncio.to_thread(synth_pcm, text)
+    return Response(content=pcm, media_type="application/octet-stream")
+
 @app.get("/pcm")
 async def pcm(text: str = Query("Привет. Тест связи.")):
     log.info(f"PCM(text): {text[:60]}")
@@ -140,7 +128,7 @@ async def chat(request: Request, rate: int = Query(16000)):
                "X-Reply-Oled": quote(translit(text), safe="")}
     return Response(content=out, media_type="application/octet-stream", headers=headers)
 
-# STREAMING: Gemini text -> Piper PCM -> chunked stream (no buffering)
+# STREAM: Gemini -> Piper -> ordinary Response with Content-Length (NOT chunked)
 @app.post("/stream")
 async def stream(request: Request, rate: int = Query(16000)):
     body = await request.body()
@@ -150,8 +138,6 @@ async def stream(request: Request, rate: int = Query(16000)):
         return Response(status_code=500, content="GEMINI_API_KEY not configured")
     wav = pcm_to_wav(body, rate)
     log.info(f"STREAM in: {len(body)} bytes @{rate}Hz")
-
-    # 1) Gemini: speech -> answer text
     try:
         resp = _gemini.models.generate_content(
             model=MODEL,
@@ -164,8 +150,6 @@ async def stream(request: Request, rate: int = Query(16000)):
     if not text:
         text = "Я не расслышал, повтори пожалуйста."
     log.info(f"REPLY: {text[:160]}")
-
-    # 2) Piper: text -> raw PCM (model rate)
     try:
         t0 = time.time()
         pcm = await asyncio.to_thread(synth_pcm, text)
@@ -173,14 +157,24 @@ async def stream(request: Request, rate: int = Query(16000)):
     except Exception as e:
         log.exception("piper error")
         return Response(status_code=502, content=f"piper error: {e}")
-
-    # 3) stream PCM in small chunks (chunked transfer, no proxy buffering)
-    async def pcm_stream():
-        CHUNK = 4096
-        for i in range(0, len(pcm), CHUNK):
-            yield pcm[i:i + CHUNK]
-
     headers = {"X-Reply-Text": quote(text, safe=""),
                "X-Reply-Oled": quote(translit(text), safe=""),
-               "X-Accel-Buffering": "no"}
-    return StreamingResponse(pcm_stream(), media_type="application/octet-stream", headers=headers)
+               "X-Accel-Buffering": "no",
+               "Cache-Control": "no-store"}
+    return Response(content=pcm, media_type="application/octet-stream", headers=headers)
+
+# speedtest: stream N zero-bytes, log how much the server actually sent
+@app.get("/speedtest")
+async def speedtest(size: int = Query(1000000)):
+    async def gen():
+        chunk = b"\0" * 65536
+        remaining = size
+        sent = 0
+        while remaining > 0:
+            n = 65536 if remaining > 65536 else remaining
+            yield chunk[:n]
+            sent += n
+            remaining -= n
+        log.info(f"speedtest: SERVER sent all {sent} bytes")
+    return StreamingResponse(gen(), media_type="application/octet-stream",
+                             headers={"X-Accel-Buffering": "no", "Cache-Control": "no-store"})
