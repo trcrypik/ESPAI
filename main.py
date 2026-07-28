@@ -51,6 +51,11 @@ def translit(text: str) -> str:
             out.append(ch)
     return "".join(out)
 
+_SENT_SPLIT_RE = re.compile(r"(?<=[.!?\u2026])\s+")
+def split_sentences(text: str):
+    parts = [p.strip() for p in _SENT_SPLIT_RE.split(text) if p.strip()]
+    return parts or ([text] if text else [])
+
 class SlashNormalizer:
     def __init__(self, a): self.a = a
     async def __call__(self, scope, receive, send):
@@ -112,7 +117,8 @@ async def chat(request: Request, rate: int = Query(16000)):
     wav = pcm_to_wav(body, rate)
     log.info(f"CHAT in: {len(body)} bytes @{rate}Hz")
     try:
-        resp = _gemini.models.generate_content(
+        resp = await asyncio.to_thread(
+            _gemini.models.generate_content,
             model=MODEL,
             contents=[types.Part.from_bytes(data=wav, mime_type="audio/wav"),
                       types.Part.from_text(text=PROMPT)])
@@ -128,7 +134,14 @@ async def chat(request: Request, rate: int = Query(16000)):
                "X-Reply-Oled": quote(translit(text), safe="")}
     return Response(content=out, media_type="application/octet-stream", headers=headers)
 
-# STREAM: Gemini -> Piper -> ordinary Response with Content-Length (NOT chunked)
+# STREAM: Gemini -> Piper, sent sentence-by-sentence as real chunked transfer.
+# Why: the old version synthesized the WHOLE reply before sending a single byte.
+# On a slow/high-latency link that means many seconds of total silence on the
+# TCP connection right after headers -- exactly the pattern that idle-timeout
+# proxies (load balancers, PaaS ingress) kill. Sending audio per-sentence as
+# soon as it's ready keeps bytes flowing continuously and gets audio to the
+# device much sooner. The ESP32 firmware already has a chunked-transfer
+# player (playStreamChunked) that this now actually exercises.
 @app.post("/stream")
 async def stream(request: Request, rate: int = Query(16000)):
     body = await request.body()
@@ -138,8 +151,10 @@ async def stream(request: Request, rate: int = Query(16000)):
         return Response(status_code=500, content="GEMINI_API_KEY not configured")
     wav = pcm_to_wav(body, rate)
     log.info(f"STREAM in: {len(body)} bytes @{rate}Hz")
+    t0 = time.time()
     try:
-        resp = _gemini.models.generate_content(
+        resp = await asyncio.to_thread(
+            _gemini.models.generate_content,
             model=MODEL,
             contents=[types.Part.from_bytes(data=wav, mime_type="audio/wav"),
                       types.Part.from_text(text=PROMPT)])
@@ -149,19 +164,32 @@ async def stream(request: Request, rate: int = Query(16000)):
         return Response(status_code=502, content=f"gemini error: {e}")
     if not text:
         text = "Я не расслышал, повтори пожалуйста."
-    log.info(f"REPLY: {text[:160]}")
-    try:
-        t0 = time.time()
-        pcm = await asyncio.to_thread(synth_pcm, text)
-        log.info(f"Piper TTS ok: {len(pcm)} bytes (~{len(pcm)/2/PLAY_RATE:.1f}s) in {time.time()-t0:.1f}s")
-    except Exception as e:
-        log.exception("piper error")
-        return Response(status_code=502, content=f"piper error: {e}")
+    log.info(f"REPLY ({time.time()-t0:.1f}s): {text[:160]}")
+
+    sentences = split_sentences(text)
+
+    async def gen():
+        tg0 = time.time()
+        total = 0
+        for i, sent in enumerate(sentences):
+            ts = time.time()
+            try:
+                pcm = await asyncio.to_thread(synth_pcm, sent)
+            except Exception:
+                log.exception(f"piper error on chunk {i+1}/{len(sentences)}")
+                continue
+            total += len(pcm)
+            log.info(f"chunk {i+1}/{len(sentences)}: {len(pcm)} bytes in {time.time()-ts:.2f}s")
+            if pcm:
+                yield pcm
+        log.info(f"STREAM done: {total} bytes, {len(sentences)} chunk(s) in {time.time()-tg0:.1f}s")
+
     headers = {"X-Reply-Text": quote(text, safe=""),
                "X-Reply-Oled": quote(translit(text), safe=""),
                "X-Accel-Buffering": "no",
                "Cache-Control": "no-store"}
-    return Response(content=pcm, media_type="application/octet-stream", headers=headers)
+    # No Content-Length here on purpose -> real Transfer-Encoding: chunked.
+    return StreamingResponse(gen(), media_type="application/octet-stream", headers=headers)
 
 # speedtest: stream N zero-bytes, log how much the server actually sent
 @app.get("/speedtest")
@@ -177,4 +205,5 @@ async def speedtest(size: int = Query(1000000)):
             remaining -= n
         log.info(f"speedtest: SERVER sent all {sent} bytes")
     return StreamingResponse(gen(), media_type="application/octet-stream",
-                             headers={"X-Accel-Buffering": "no", "Cache-Control": "no-store"})
+                             headers={"X-Accel-Buffering": "no", "Cache-Control": "no-store",
+                                      "Content-Length": str(size)})
