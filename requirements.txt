@@ -1,5 +1,4 @@
-fastapi
-uvicorn[standard]
-piper-tts
-google-genai
-lameenc
+fastapi>=0.115.0
+uvicorn[standard]>=0.30.0
+google-genai>=1.0.0
+edge-tts>=6.1.0
