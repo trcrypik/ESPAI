@@ -5,6 +5,7 @@ from fastapi.responses import Response, PlainTextResponse, StreamingResponse
 from piper import PiperVoice
 from google import genai
 from google.genai import types
+import lameenc
 
 logging.basicConfig(level=logging.INFO)
 log = logging.getLogger("va")
@@ -15,6 +16,7 @@ VOICE_ONNX  = os.getenv("PIPER_ONNX", "/app/models/ru_RU-ruslan-medium.onnx")
 VOICE_JSON  = os.getenv("PIPER_JSON", "/app/models/ru_RU-ruslan-medium.onnx.json")
 MODEL       = os.getenv("GEMINI_MODEL", "gemini-3.5-flash-lite")
 API_KEY     = os.getenv("GEMINI_API_KEY", "")
+MP3_BITRATE_KBPS = int(os.getenv("MP3_BITRATE_KBPS", "32"))   # lower = smaller/worse; 24-40 is the usable speech range
 PROMPT      = ("Ты голосовой помощник на русском языке. Отвечай естественно и по делу, "
                "без воды, обычно 2-4 предложения. Без списков, без скобок, без markdown, "
                "чтобы ответ было удобно озвучить синтезатором речи.")
@@ -27,6 +29,18 @@ def load_voice():
     t0 = time.time()
     _voice = PiperVoice.load(VOICE_ONNX, config_path=VOICE_JSON)
     log.info(f"Piper voice loaded in {time.time()-t0:.1f}s, sample_rate={_voice.config.sample_rate}")
+
+def make_mp3_encoder():
+    # One encoder instance per reply, fed sentence-by-sentence so it stays a
+    # single continuous, valid MP3 bitstream regardless of how many HTTP
+    # chunks it ends up split across.
+    enc = lameenc.Encoder()
+    enc.set_bit_rate(MP3_BITRATE_KBPS)
+    enc.set_in_sample_rate(PLAY_RATE)
+    enc.set_channels(1)
+    enc.set_quality(2)   # 2 = highest quality / slowest, 7 = fastest; CPU isn't the bottleneck here
+    enc.silence()        # don't let LAME spam stdout
+    return enc
 
 @app.on_event("startup")
 async def startup():
@@ -134,14 +148,19 @@ async def chat(request: Request, rate: int = Query(16000)):
                "X-Reply-Oled": quote(translit(text), safe="")}
     return Response(content=out, media_type="application/octet-stream", headers=headers)
 
-# STREAM: Gemini -> Piper, sent sentence-by-sentence as real chunked transfer.
-# Why: the old version synthesized the WHOLE reply before sending a single byte.
-# On a slow/high-latency link that means many seconds of total silence on the
-# TCP connection right after headers -- exactly the pattern that idle-timeout
-# proxies (load balancers, PaaS ingress) kill. Sending audio per-sentence as
-# soon as it's ready keeps bytes flowing continuously and gets audio to the
-# device much sooner. The ESP32 firmware already has a chunked-transfer
-# player (playStreamChunked) that this now actually exercises.
+# STREAM: Gemini -> Piper -> MP3, sent sentence-by-sentence as real chunked transfer.
+# Why MP3: raw PCM at 22050Hz/16-bit/mono is 44100 bytes/sec. At the
+# 0.1-0.5 Mbit/s this device is getting to Northflank that alone can be
+# slower than realtime, so any transport hiccup empties the playback buffer.
+# MP3 at 32 kbps mono is ~4000 bytes/sec -- about 1/10th the data -- which
+# both finishes transferring faster (less time for something in the network
+# path to time the connection out) and leaves a much bigger cushion before
+# the device's buffer runs dry.
+# Why still per-sentence: the old version synthesized the WHOLE reply before
+# sending a single byte. On a slow/high-latency link that's many seconds of
+# total silence on the TCP connection right after headers -- exactly the
+# pattern idle-timeout proxies kill. The ESP32 firmware already has a
+# chunked-transfer MP3 player that this now feeds.
 @app.post("/stream")
 async def stream(request: Request, rate: int = Query(16000)):
     body = await request.body()
@@ -170,7 +189,9 @@ async def stream(request: Request, rate: int = Query(16000)):
 
     async def gen():
         tg0 = time.time()
-        total = 0
+        total_pcm = 0
+        total_mp3 = 0
+        encoder = await asyncio.to_thread(make_mp3_encoder)
         for i, sent in enumerate(sentences):
             ts = time.time()
             try:
@@ -178,18 +199,34 @@ async def stream(request: Request, rate: int = Query(16000)):
             except Exception:
                 log.exception(f"piper error on chunk {i+1}/{len(sentences)}")
                 continue
-            total += len(pcm)
-            log.info(f"chunk {i+1}/{len(sentences)}: {len(pcm)} bytes in {time.time()-ts:.2f}s")
-            if pcm:
-                yield pcm
-        log.info(f"STREAM done: {total} bytes, {len(sentences)} chunk(s) in {time.time()-tg0:.1f}s")
+            total_pcm += len(pcm)
+            try:
+                mp3_bytes = await asyncio.to_thread(encoder.encode, pcm)
+            except Exception:
+                log.exception(f"mp3 encode error on chunk {i+1}/{len(sentences)}")
+                continue
+            total_mp3 += len(mp3_bytes)
+            log.info(f"chunk {i+1}/{len(sentences)}: pcm={len(pcm)}B mp3={len(mp3_bytes)}B in {time.time()-ts:.2f}s")
+            if mp3_bytes:
+                yield bytes(mp3_bytes)
+        try:
+            tail = await asyncio.to_thread(encoder.flush)
+        except Exception:
+            log.exception("mp3 flush error")
+            tail = b""
+        if tail:
+            total_mp3 += len(tail)
+            yield bytes(tail)
+        log.info(f"STREAM done: pcm={total_pcm}B mp3={total_mp3}B ({MP3_BITRATE_KBPS}kbps), "
+                 f"{len(sentences)} chunk(s) in {time.time()-tg0:.1f}s")
 
     headers = {"X-Reply-Text": quote(text, safe=""),
                "X-Reply-Oled": quote(translit(text), safe=""),
+               "X-Audio-Format": "mp3",
                "X-Accel-Buffering": "no",
                "Cache-Control": "no-store"}
     # No Content-Length here on purpose -> real Transfer-Encoding: chunked.
-    return StreamingResponse(gen(), media_type="application/octet-stream", headers=headers)
+    return StreamingResponse(gen(), media_type="audio/mpeg", headers=headers)
 
 # speedtest: stream N zero-bytes, log how much the server actually sent
 @app.get("/speedtest")
